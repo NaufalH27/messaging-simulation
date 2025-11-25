@@ -1,0 +1,2 @@
+# messaging-simulation
+kafka + scylla
