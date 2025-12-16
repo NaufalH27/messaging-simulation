@@ -1,73 +1,215 @@
 import json
-from datetime import datetime
+import time
+from typing import Optional, Type, TypeVar, Generic, List, Tuple
+import numpy as np
 from confluent_kafka import Consumer
+from eqt_predict_tf29 import predict
+import tensorflow as tf
+from keras.models import load_model
+from eqt_predict_tf29 import SeqSelfAttention, FeedForward, LayerNormalization, f1
+from collections import deque
+from pydantic import BaseModel, ConfigDict, field_validator
+from datetime import datetime
 from cassandra.cluster import Cluster
+from cassandra.query import SimpleStatement
 
-
-consumer = Consumer({
-    "bootstrap.servers": "localhost:9092",
-    "group.id": "seismic-consumer",
-    "auto.offset.reset": "earliest"
-})
-
-consumer.subscribe(["seismic"])  
-
-
-cluster = Cluster(['127.0.0.1'], port=9042)
+cluster = Cluster(['127.0.0.1'], port=9042)  
 session = cluster.connect()
-
-session.execute("""
-    CREATE KEYSPACE IF NOT EXISTS seismic
-    WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}
+KEYSPACE = "seismic_data"
+session.execute(f"""
+    CREATE KEYSPACE IF NOT EXISTS {KEYSPACE}
+    WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': 1}};
 """)
 
+session.set_keyspace(KEYSPACE)
 session.execute("""
-    CREATE TABLE IF NOT EXISTS seismic.waveform (
+    CREATE TABLE IF NOT EXISTS window_predictions (
         network text,
         station text,
-        location text,
-        channel text,
         starttime timestamp,
         endtime timestamp,
-        sampling_rate double,
-        total_sample int,
-        data list<double>,
-        PRIMARY KEY ((network, station, channel), starttime, endtime)
-    )
+        minio_ref text,
+        PRIMARY KEY ((network, station), starttime)
+    ) WITH CLUSTERING ORDER BY (starttime ASC);
 """)
 
-insert_query = session.prepare("""
-    INSERT INTO seismic.waveform (
-        network, station, location, channel,
-        starttime, endtime,
-        sampling_rate, total_sample, data
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-""")
+print("Scylla table window_prediction loaded")
 
 
-while True:
-    msg = consumer.poll(1.0)
 
-    if msg is None:
-        continue
+# MODELS
+MODEL_PATH = "components/EqT_original_model.h5"
+gpus = tf.config.experimental.list_physical_devices('GPU')
 
-    message = json.loads(msg.value().decode("utf-8"))
+tf.config.experimental.set_virtual_device_configuration(
+    gpus[0],
+    [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=3050)]
+)
 
-    session.execute(
-        insert_query, (
-            message["network"],
-            message["station"],
-            message["location"],
-            message["channel"],
-            datetime.fromisoformat(message["starttime"].replace("Z", "")),
-            datetime.fromisoformat(message["endtime"].replace("Z", "")),
-            message["sampling_rate"],
-            message["total_sample"],
-            message["data"],
-        )
+model = load_model(
+    MODEL_PATH,
+    custom_objects={
+        'SeqSelfAttention': SeqSelfAttention,
+        'FeedForward': FeedForward,
+        'LayerNormalization': LayerNormalization,
+        'f1': f1
+    }
+)
+
+print(f"EqTransfomer model loaded ({MODEL_PATH})")
+
+
+# KAFKA
+conf = {
+    "bootstrap.servers": "localhost:9092",
+    "group.id": "seismic-consumer5",
+    "enable.auto.commit": False,
+    "auto.offset.reset": "earliest"
+}
+
+consumer = Consumer(conf)
+consumer.subscribe(["seismic"])
+
+print("kafka seismic consumer started")
+
+
+class SeismicWindow(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    network: str
+    station: str
+    starttime: datetime
+    endtime: datetime
+    sampling_rate: float
+    data: np.ndarray
+    samples_per_channel: int
+    channel_order: Optional[Tuple[str, ...]] = None
+    num_channels: int
+    total_samples: int
+    sample_counts: Tuple[int, ...]
+
+    @field_validator('data', mode='before')
+    @classmethod
+    def convert_data_to_numpy(cls, v):
+        return np.array(v, dtype=np.float32)
+
+T = TypeVar("T")  
+class RingBuffer(Generic[T]):
+    def __init__(self, maxlen: int, dtype: Type[T]):
+        self.maxlen = maxlen
+        self._buffer = deque(maxlen=maxlen)
+        self._dtype = dtype
+
+    def append(self, item: T):
+        if not isinstance(item, self._dtype):
+            raise TypeError(f"RingBuffer only accepts {self._dtype.__name__}, got {type(item).__name__}")
+        self._buffer.append(item)
+
+    def get(self, idx: int) -> T:
+        item = self._buffer[idx]
+        if not isinstance(item, self._dtype):
+            raise TypeError(f"Expected {self._dtype.__name__}, got {type(item).__name__}")
+        return item
+    
+    def get_len(self):
+        return len(self._buffer)
+
+    def delete_all(self):
+        self._buffer = deque(maxlen=self.maxlen)
+
+    def __len__(self):
+        return len(self._buffer)
+
+    def __iter__(self):
+        return iter(self._buffer)
+
+    def __repr__(self):
+        return repr(self._buffer)
+
+WINDOW_SECONDS = 4
+RING_BUFFER_LENGTH = 60 / WINDOW_SECONDS  # seconds / window
+
+if RING_BUFFER_LENGTH % 1 != 0:
+    raise ValueError(
+        f"WINDOW_SECONDS={WINDOW_SECONDS} does not evenly divide 60 seconds.\n"
+        "EQTransformer (EQT) requires input seismogram chunks to be exactly 60 seconds in length.\n"
+        "Your sliding windows must evenly tile 60 seconds for the model to work correctly.\n"
+        "Please choose a WINDOW_SECONDS value that is a factor of 60 (e.g., 1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, 60)."
     )
+rb = RingBuffer(maxlen=int(RING_BUFFER_LENGTH),dtype=SeismicWindow)
 
-    print(
-        f"Inserted: {message['station']} {message['channel']} "
-        f"{message['starttime']} samples={message['total_sample']}"
-    )
+try :
+    while True:
+        msg = consumer.poll(1.0) 
+        if msg is None:
+            continue
+        if msg.error():
+            print("Consumer error:", msg.error())
+            continue
+
+        message = json.loads(msg.value().decode("utf-8"))
+
+        try:
+            window = SeismicWindow(**message)
+        except Exception as e:
+            print("Failed to convert json to SeismicWindow object:", e)
+            continue
+        
+        # if window not 400, 3
+        expected_shape = (int(WINDOW_SECONDS * window.sampling_rate),3)
+        if window.data.shape != expected_shape:
+            print(f"window shape not aligned {window.data.shape} != {expected_shape} for data {window.starttime}-{window.endtime} ")
+            rb.delete_all()
+            continue
+
+        if window.channel_order != ("Z", "N", "E"):
+            print(f"window channel not true {window.channel_order} != ZNE for data {window.starttime}-{window.endtime} ")
+            rb.delete_all()
+            continue
+
+        if len(rb) == 0:
+            rb.append(window)
+        else:
+            latest = rb.get(-1)
+            if window.starttime == latest.endtime:
+                rb.append(window)
+            elif window.starttime > latest.endtime:
+                print(f"data not aligned {window.starttime} > {latest.endtime}")
+                rb.delete_all()
+                continue
+            elif window.starttime < latest.endtime:
+                continue # ignore late window
+        if rb.get_len() == rb.maxlen:
+            merged_trace = np.concatenate([rb.get(i).data for i in range(len(rb))], axis=0)
+
+            print(f"predicting window {window.starttime} - {window.endtime}")
+            start = time.perf_counter()
+            preds = predict(model=model, seismic_trace=merged_trace)
+            end = time.perf_counter()
+            elapsed = end - start
+            pp_window = preds["PP_mean"][-400:]
+            ss_window = preds["SS_mean"][-400:]
+            dd_window = preds["DD_mean"][-400:]
+            print(f"window {window.starttime} - {window.endtime} predicted successfully in {elapsed}")
+
+            # minio_ref = "a"
+
+            # insert_stmt = session.prepare("""
+            #     INSERT INTO window_predictions (
+            #         network, station, starttime, endtime, minio_ref
+            #     ) VALUES (?, ?, ?, ?, ?)
+            # """)
+            # session.execute(
+            #     insert_stmt,
+            #     (window.network, window.station, window.starttime, window.endtime, minio_ref)
+            # )
+            # print(f"Inserted window {window.starttime}-{window.endtime} into Scylla with minio_ref={minio_ref}")
+
+
+
+except KeyboardInterrupt:
+    print("Caught KeyboardInterrupt, stopping…")
+finally:
+    print("Terminating processes…")
+    consumer.close()
+
+
