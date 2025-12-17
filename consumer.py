@@ -86,7 +86,7 @@ print("Scylla table window_prediction loaded")
 
 
 # MODELS
-MODEL_PATH = "components/EqT_model_conservative.h5"
+MODEL_PATH = "components/EqT_model_original.h5"
 GPU_MEMORY_LIMIT=2000
 gpus = tf.config.experimental.list_physical_devices('GPU')
 if gpus:
