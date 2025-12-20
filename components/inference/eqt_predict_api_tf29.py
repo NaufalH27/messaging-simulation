@@ -4,67 +4,43 @@ from tensorflow.keras import backend as K
 import numpy as np
 
 
-def predict(
-    model,
-    seismic_trace,
-    mc_samples=0
-):
-    """
-    Single-trace streaming prediction with optional Monte Carlo uncertainty.
+def predict(model, seismic_traces, batch_size=32):
+    valid_traces = []
+    invalid_indices = []
 
-    Parameters
-    ----------
-    model : tf.keras.Model
-        Loaded EqT model
-    seismic_trace : np.ndarray
-        Shape (6000, 3) or (1, 6000, 3)
-    mc_samples : int
-        Number of Monte Carlo samples (0 = no uncertainty)
+    for i, trace in enumerate(seismic_traces):
+        if trace.shape == (6000, 3):
+            valid_traces.append(trace)
+        else:
+            invalid_indices.append(i)
 
-    Returns
-    -------
-    results : dict
-        Mean and std of detection, P, and S probabilities
-    """
+    if len(valid_traces) == 0:
+        raise ValueError("No valid traces with shape (6000, 3) found.")
 
-    if seismic_trace.ndim == 2:
-        seismic_trace = seismic_trace[np.newaxis, ...]
+    valid_traces = np.array(valid_traces)
+    N = valid_traces.shape[0]
+    DD_list, PP_list, SS_list = [], [], []
 
-    seismic_trace = tf.convert_to_tensor(seismic_trace, dtype=tf.float32)
+    for i in range(0, N, batch_size):
+        batch = valid_traces[i:i+batch_size]
+        batch = tf.convert_to_tensor(batch, dtype=tf.float32)
+        det, p, s = model(batch, training=False)
+        DD_list.append(det.numpy()[..., 0])
+        PP_list.append(p.numpy()[..., 0])
+        SS_list.append(s.numpy()[..., 0])
 
-    if mc_samples <= 1:
-        det, p, s = model(seismic_trace, training=False)
-
-        return {
-            "DD_mean": det.numpy()[0, :, 0],
-            "PP_mean": p.numpy()[0, :, 0],
-            "SS_mean": s.numpy()[0, :, 0],
-            "DD_std": np.zeros(det.shape[1]),
-            "PP_std": np.zeros(p.shape[1]),
-            "SS_std": np.zeros(s.shape[1]),
-        }
-
-    det_mc, p_mc, s_mc = [], [], []
-
-    for _ in range(mc_samples):
-        det, p, s = model(seismic_trace, training=True)
-
-        det_mc.append(det.numpy())
-        p_mc.append(p.numpy())
-        s_mc.append(s.numpy())
-
-    det_mc = np.stack(det_mc, axis=0)  # (mc, 1, T, 1)
-    p_mc   = np.stack(p_mc, axis=0)
-    s_mc   = np.stack(s_mc, axis=0)
-
+    print(f"Skipped traces at indices: {invalid_indices}") 
     return {
-        "DD_mean": det_mc.mean(axis=0)[0, :, 0],
-        "PP_mean": p_mc.mean(axis=0)[0, :, 0],
-        "SS_mean": s_mc.mean(axis=0)[0, :, 0],
-        "DD_std": det_mc.std(axis=0)[0, :, 0],
-        "PP_std": p_mc.std(axis=0)[0, :, 0],
-        "SS_std": s_mc.std(axis=0)[0, :, 0],
+        "DD_mean": np.concatenate(DD_list, axis=0),
+        "PP_mean": np.concatenate(PP_list, axis=0),
+        "SS_mean": np.concatenate(SS_list, axis=0),
+        "valid_count": N,
+        "skipped_indices": invalid_indices
     }
+
+
+
+
 
 
 

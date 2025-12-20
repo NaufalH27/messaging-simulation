@@ -1,5 +1,6 @@
 import json
 import math
+import sys
 from typing import Dict
 import time
 import uuid
@@ -9,9 +10,7 @@ from obspy import UTCDateTime
 from confluent_kafka.admin import AdminClient, NewTopic
 from confluent_kafka import Producer
 import threading
-
 import pandas as pd
-
 
 try:
     admin_client = AdminClient({
@@ -33,11 +32,12 @@ try:
             print(f"INFO: Topic '{topic}' already exists")
 except Exception as e:
     print(e)
-    exit
+    sys.exit(1)
 
 SEEDLINK_ENDPOINT = "rtserve.iris.washington.edu:18000"
 
-WINDOW_SECONDS = 4
+WINDOW_SECONDS = 5
+WINDOW_US = WINDOW_SECONDS * 1_000_000
 class SampleWindow:
     def __init__(self, fs, t0, orientations):
         self.orientation_order = tuple(orientations)
@@ -66,8 +66,9 @@ class SampleWindow:
         if channel not in self.grid:
             raise ValueError(f"Invalid channel: {channel}")
 
-        dt = ts - self.T0
-        index = round(dt * self.fs)
+        dt_us = round(ts.timestamp * 1_000_000 - self.T0.timestamp * 1_000_000)
+        period_us = round(1_000_000 / self.fs)  
+        index = round(dt_us // period_us)
 
         if not (0 <= index < self.SIZE):
             raise ValueError(
@@ -91,27 +92,29 @@ class Sensor:
         self.windows_lock = threading.Lock()
         self.network = network
         self.station = station
+        self.window_size = WINDOW_SECONDS * fs
         self.sensor_code = sensor_code # XX
         self.orientation = orientation #ZNE
         self.fs = fs
     
     def get_window(self, ts: UTCDateTime):
+        ts_us = round(ts.timestamp * 1_000_000)
+
         with self.windows_lock:
-            ref_t0 = UTCDateTime(0)
+            ref_us = round(UTCDateTime(0).timestamp * 1_000_000)
 
-            offset = ts - ref_t0
-            win_index = float(offset // WINDOW_SECONDS)
-            window_t0 = ref_t0 + win_index * WINDOW_SECONDS
-            window_key = float(window_t0)
+            offset_us = ts_us - ref_us
+            win_index = offset_us // WINDOW_US
+            window_us = ref_us + win_index * WINDOW_US
 
-            if window_key not in self.windows:
-                self.windows[window_key] = SampleWindow(
+            if window_us not in self.windows:
+                self.windows[window_us] = SampleWindow(
                     fs=self.fs,
-                    t0=window_t0,
+                    t0=UTCDateTime(window_us / 1_000_000),
                     orientations=self.orientation
                 )
 
-            return self.windows[window_key]
+            return self.windows[window_us]
 
     def del_windows(self, key):
         if key not in self.windows:
@@ -150,80 +153,92 @@ def process_station(network, station_name, seed):
     print(f"running client: {network} {station_name} {seed}")
     client.run()
 
-def emitter_poll(key:str,s:Sensor):
+def emitter_poll(key: str, s: Sensor):
     print(f"emitter for {key} started")
-    a = [None]
+
+    nan_threshold = 0.95
+    max_age = 60 
+    last_yyy = []
 
     while True:
-        ws = s.windows.copy()
-        ws = dict(sorted(ws.items()))
-        emit_jobs = []
-        drop_keys = []
         age_now = UTCDateTime.now()
+        yyy = [
+            tuple(s.windows[w_key].channel_counts.values())
+            for w_key in sorted(s.windows)
+        ]
+
+        if yyy != last_yyy:
+            print(f"current {key} windows: {yyy} ({len(yyy)})")
+        last_yyy = yyy
+
         with s.windows_lock:
-            yyy = []
-            for w in ws.values():
-                yyy.append(tuple(w.channel_counts.values()))
-            if a != yyy:
-                print(f"current {key} windows : {yyy} {len(yyy)}")
-            a = yyy
-            for w_key in list(s.windows.keys()):
+            if not s.windows:
+                time.sleep(0.1)
+                continue
+            keys = sorted(s.windows)
+            while keys:
+                w_key = keys[0]
                 w = s.windows[w_key]
                 with w.emit_lock:
                     if w.emitted:
+                        s.del_windows(w_key)
+                        keys.pop(0)
                         continue
 
                     filled_ratio = w.total_filled / w.total_expected
                     age = age_now - w.last_write_timestamp
-                    nan_treshold = 0.95
-                    max_age = 60
+                    ready_to_emit = (
+                        filled_ratio >= 1.0 or
+                        (filled_ratio >= nan_threshold and age > max_age)
+                    )
+                    ready_to_drop = (age > max_age and filled_ratio < nan_threshold)
+                    if not ready_to_emit and not ready_to_drop:
+                        break
 
-                    if filled_ratio >= 1.0 or (filled_ratio >= nan_treshold and age > max_age):
-                        merged = np.column_stack([
-                            w.grid[ch] for ch in w.orientation_order
-                        ])
+                    if ready_to_emit:
+                        merged = np.column_stack([w.grid[ch] for ch in w.orientation_order])
 
                         message = {
-                            "key" : key,
+                            "key": key,
                             "network": s.network,
                             "station": s.station,
-                            "sensor_code" : s.sensor_code,
+                            "sensor_code": s.sensor_code,
+                            "sampling_rate": s.fs,
+                            "orientation_order": s.orientation,
                             "starttime": w.T0.isoformat(),
                             "endtime": w.Tend.isoformat(),
-                            "sampling_rate": s.fs,
-                            "samples_per_channel": w.SIZE,
-                            "num_channels": len(w.orientation_order),
-                            "orientation_order" : w.orientation_order,
-                            "total_samples": w.SIZE * len(w.orientation_order),
+                            "sample_counts": tuple(w.channel_counts.values()),
                             "trace": merged.tolist(),
-                            "sample_counts" : tuple(w.channel_counts.values())
                         }
+                        producer.produce(
+                            topic_name,
+                            key=key.encode(),
+                            value=json.dumps(message).encode("utf-8"),
+                        )
+                        producer.poll(0)
+                        print(
+                            f"windows {key}: sent {w_key} "
+                            f"{message['starttime']}-{message['endtime']} "
+                            f"{message['sample_counts']}"
+                        )
 
-                        w.emitted = True
-                        emit_jobs.append((w_key, message))
+                    if ready_to_drop:
+                        print(
+                            f"windows {key}: dropped {w_key} "
+                            f"(age) {tuple(w.channel_counts.values())}"
+                        )
 
-                    elif age > max_age and filled_ratio < nan_treshold:
-                        w.emitted = True
-                        drop_keys.append(w_key)
+                    w.emitted = True
+                    s.del_windows(w_key)
+                    keys.pop(0)
 
-            for w_key, message in emit_jobs:
-                producer.produce(topic_name, value=json.dumps(message).encode("utf-8"))
-                producer.poll(0)
-                print(f"windows {key}: send {w_key}: {message['starttime']}-{message['endtime']} ({message['sample_counts']})")
-
-            for w_key in drop_keys:
-                print(f"windows {key}: {w_key} deleted (age) {tuple(s.windows[w_key].channel_counts.values())}")
-                s.del_windows(w_key)
-
-            for w_key, _ in emit_jobs:
-                print(f"windows {key}: {w_key} deleted (emitted to kafka)")
-                s.del_windows(w_key)
         time.sleep(0.1)
+
 
 
 def main():
     tasks = []
-    df = pd.read_csv("station_list.csv")
+    df = pd.read_csv("artifacts/station_list.csv")
     for _, row in df.iterrows():
         network = row["network"]
         station = row["station"]
@@ -246,7 +261,7 @@ def main():
                 orientation=orientation
             )
 
-        print(f"created sensor {sensor_key} ({orientation})")
+        print(f"created sensor {sensor_key} ({orientation} {fs}hz)")
 
         for o in orientation:
             channel = sensor_code + o

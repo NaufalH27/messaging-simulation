@@ -59,13 +59,6 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
-  nats:
-    image: nats:latest
-    container_name: nats
-    ports:
-      - "4222:4222"  
-      - "8222:8222" 
-
 
 volumes:
   minio_data:
