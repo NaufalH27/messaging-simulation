@@ -1,204 +1,203 @@
-import math
-from io import BytesIO
-
 import streamlit as st
 import numpy as np
-
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from scipy.signal import find_peaks
-
 from cassandra.cluster import Cluster
 from minio import Minio
+import io
+from scipy.signal import find_peaks
+from datetime import timedelta
 
-
-
-CASSANDRA_HOSTS = ["127.0.0.1"]
-KEYSPACE = "seismic_data"
-TABLE = "window_predictions"
+# =========================
+# CONFIG
+# =========================
+CASSANDRA_HOSTS = ['127.0.0.1']
+KEYSPACE = 'seismic'
+TABLE = 'window_predictions'
 
 MINIO_ENDPOINT = "localhost:9000"
 MINIO_ACCESS_KEY = "minioadmin"
 MINIO_SECRET_KEY = "minioadmin"
 MINIO_BUCKET = "seismic"
 
-DET_THRESHOLD = 0.5
-P_THRESHOLD = 0.3
-S_THRESHOLD = 0.3
+FS = 100
+MAX_WINDOW_SAMPLES = 360_000
+P_THRESHOLD = 0.5
+S_THRESHOLD = 0.5
 MIN_DISTANCE_SEC = 0.5
 
+# =========================
+# STREAMLIT UI
+# =========================
 st.set_page_config(layout="wide")
-st.title("Seismic Streaming Dashboard")
+st.title("Seismic Stream Viewer")
 
+# =========================
+# CASSANDRA CONNECTION
+# =========================
 @st.cache_resource
-def get_cassandra():
-    return Cluster(CASSANDRA_HOSTS).connect(KEYSPACE)
+def get_session():
+    cluster = Cluster(CASSANDRA_HOSTS)
+    return cluster.connect(KEYSPACE)
 
-@st.cache_resource
-def get_minio():
-    return Minio(
-        MINIO_ENDPOINT,
-        access_key=MINIO_ACCESS_KEY,
-        secret_key=MINIO_SECRET_KEY,
-        secure=False,
-    )
+session = get_session()
 
-session = get_cassandra()
-minio = get_minio()
-
-
+# =========================
+# LOAD AVAILABLE KEYS / MODELS
+# =========================
 @st.cache_data
-def get_key_model_pairs():
+def load_keys_models():
     rows = session.execute(
-        f"SELECT key, model_name, starttime FROM {TABLE}"
+        f"SELECT DISTINCT key, model_name FROM {TABLE}"
     )
+    return sorted({(r.key, r.model_name) for r in rows})
 
-    latest = {}
-    for r in rows:
-        k = (r.key, r.model_name)
-        latest[k] = max(latest.get(k, r.starttime), r.starttime)
+pairs = load_keys_models()
 
-    return sorted(latest.keys(), key=lambda x: latest[x])
+key = st.selectbox("Station Key", sorted(set(p[0] for p in pairs)))
+models = sorted(p[1] for p in pairs if p[0] == key)
+model = st.selectbox("Model", models)
 
-
-@st.cache_data
-@st.cache_data
+# =========================
+# LOAD DATA
+# =========================
+@st.cache_data(show_spinner=True)
 def load_data(key, model):
     rows = session.execute(
         f"""
-        SELECT starttime, sampling_rate, minio_ref
-        FROM {TABLE}
-        WHERE key=%s AND model_name=%s
+        SELECT * FROM {TABLE}
+        WHERE key = %s AND model_name = %s
         ORDER BY starttime ASC
         """,
-        (key, model),
+        (key, model)
     )
 
-    times = []
-    traces = []
-    dets = []
-    ps = []
-    ss = []
-
-    fs = None
-    last_end_time = None
-
-    for r in rows:
-        fs = int(r.sampling_rate)
-
-        obj = minio.get_object(MINIO_BUCKET, r.minio_ref)
-        raw = obj.read()
-        obj.close()
-        obj.release_conn()
-
-        arr = np.load(BytesIO(raw))
-
-        n = arr["dd"].shape[0]
-
-        t0 = np.datetime64(r.starttime, "ns")
-        dt = np.timedelta64(int(1e9 // fs), "ns")
-        t = t0 + np.arange(n) * dt
-
-        if last_end_time is not None:
-            gap = t[0] - last_end_time
-            if gap > dt:
-                times.append(np.array([np.datetime64("NaT")]))
-                traces.append(np.full((1, 3), np.nan))
-                dets.append(np.array([np.nan]))
-                ps.append(np.array([np.nan]))
-                ss.append(np.array([np.nan]))
-
-        times.append(t)
-        traces.append(arr["trace"])
-        dets.append(arr["dd"])
-        ps.append(arr["pp"])
-        ss.append(arr["ss"])
-
-        last_end_time = t[-1] + dt
-
-    return {
-        "time": np.concatenate(times),
-        "trace": np.vstack(traces),
-        "det": np.concatenate(dets),
-        "p": np.concatenate(ps),
-        "s": np.concatenate(ss),
-        "fs": fs,
-    }
-
-
-def make_figure(data, t_start, t_end):
-    mask = (data["time"] >= t_start) & (data["time"] <= t_end)
-
-    fig = make_subplots(
-        rows=4, cols=1, shared_xaxes=True,
-        subplot_titles=("Z", "N", "E", "DET / P / S"),
+    minio_client = Minio(
+        MINIO_ENDPOINT,
+        access_key=MINIO_ACCESS_KEY,
+        secret_key=MINIO_SECRET_KEY,
+        secure=False
     )
 
-    for i in range(3):
-        fig.add_trace(
-            go.Scattergl(
-                x=data["time"][mask],
-                y=data["trace"][mask, i],
-                showlegend=False,
-            ),
-            row=i + 1, col=1,
-        )
+    traces, dets, ps, ss = [], [], [], []
+    t0 = None
 
-    fig.add_trace(go.Scattergl(x=data["time"][mask], y=data["det"][mask], name="DET"), 4, 1)
-    fig.add_trace(go.Scattergl(x=data["time"][mask], y=data["p"][mask], name="P"), 4, 1)
-    fig.add_trace(go.Scattergl(x=data["time"][mask], y=data["s"][mask], name="S"), 4, 1)
+    for row in rows:
+        if t0 is None:
+            t0 = row.starttime
 
-    dist = int(MIN_DISTANCE_SEC * data["fs"])
-    pks_p, _ = find_peaks(data["p"][mask], height=P_THRESHOLD, distance=dist)
-    pks_s, _ = find_peaks(data["s"][mask], height=S_THRESHOLD, distance=dist)
+        response = minio_client.get_object(MINIO_BUCKET, row.minio_ref)
+        data_bytes = response.read()
+        response.close()
+        response.release_conn()
 
-    for i in pks_p:
-        if data["det"][mask][i] >= DET_THRESHOLD:
-            fig.add_vline(x=data["time"][mask][i], line_color="green", line_dash="dash")
+        with np.load(io.BytesIO(data_bytes)) as f:
+            traces.append(f["trace"])
+            dets.append(f["dd"])
+            ps.append(f["pp"])
+            ss.append(f["ss"])
 
-    for i in pks_s:
-        if data["det"][mask][i] >= DET_THRESHOLD:
-            fig.add_vline(x=data["time"][mask][i], line_color="red", line_dash="dash")
+    return (
+        np.concatenate(traces),
+        np.concatenate(dets),
+        np.concatenate(ps),
+        np.concatenate(ss),
+        t0,
+    )
 
-    fig.update_yaxes(range=[0, 1], row=4, col=1)
-    fig.update_layout(height=900, hovermode="x unified")
+merged_trace, merged_det, merged_p, merged_s, t0 = load_data(key, model)
 
-    return fig
+# =========================
+# METADATA
+# =========================
+total_samples = len(merged_det)
+end_datetime = t0 + timedelta(seconds=total_samples / FS)
 
-pairs = get_key_model_pairs()
-labels = [f"{k} | {m}" for k, m in pairs]
-
-choice = st.selectbox("Key / Model", labels)
-key, model = pairs[labels.index(choice)]
-
-DATA = load_data(key, model)
-
-t_min = DATA["time"][0]
-t_max = DATA["time"][-1]
-
-duration_sec = int((t_max - t_min) / np.timedelta64(1, "s"))
-
-window_sec = st.slider(
-    "Window (sec)",
-    min_value=10,
-    max_value=min(600, duration_sec),
-    value=120,
+st.info(
+    f"""
+**Total samples:** {total_samples:,}  
+**Start time:** {t0}  
+**End time:** {end_datetime}
+"""
 )
 
-center_sec = st.slider(
-    "Scroll",
+# =========================
+# SAMPLE SELECTION
+# =========================
+start_sample = st.number_input(
+    "Start sample",
     min_value=0,
-    max_value=duration_sec,
-    value=duration_sec,
+    max_value=total_samples - 1,
+    value=0,
+    step=1000,
 )
 
-center_time = t_min + np.timedelta64(center_sec, "s")
-half = np.timedelta64(window_sec // 2, "s")
-
-t_start = center_time - half
-t_end = center_time + half
-
-st.plotly_chart(
-    make_figure(DATA, t_start, t_end),
-    use_container_width=True,
+end_sample = st.number_input(
+    "End sample",
+    min_value=1,
+    max_value=total_samples,
+    value=min(6000, total_samples),
+    step=1000,
 )
+
+# Enforce max window
+if end_sample - start_sample > MAX_WINDOW_SAMPLES:
+    start_sample = max(0, end_sample - MAX_WINDOW_SAMPLES)
+    st.warning(
+        f"Window limited to {MAX_WINDOW_SAMPLES:,} samples. "
+        f"Start adjusted to {start_sample}."
+    )
+
+# =========================
+# WINDOW
+# =========================
+trace_win = merged_trace[start_sample:end_sample]
+det_win = merged_det[start_sample:end_sample]
+p_win = merged_p[start_sample:end_sample]
+s_win = merged_s[start_sample:end_sample]
+
+dt = 1 / FS
+time_axis = [
+    t0 + timedelta(seconds=(start_sample + i) * dt)
+    for i in range(len(det_win))
+]
+
+# =========================
+# PEAK PICKING
+# =========================
+MIN_DISTANCE = int(MIN_DISTANCE_SEC * FS)
+p_peaks, _ = find_peaks(p_win, height=P_THRESHOLD, distance=MIN_DISTANCE)
+s_peaks, _ = find_peaks(s_win, height=S_THRESHOLD, distance=MIN_DISTANCE)
+
+# =========================
+# PLOTLY FIGURE
+# =========================
+fig = make_subplots(
+    rows=4,
+    cols=1,
+    shared_xaxes=True,
+    vertical_spacing=0.02,
+    subplot_titles=("Channel Z", "Channel N", "Channel E", "Probabilities"),
+)
+
+for i, ch in enumerate(["Z", "N", "E"]):
+    fig.add_trace(
+        go.Scatter(x=time_axis, y=trace_win[:, i], mode="lines", name=f"{ch}"),
+        row=i + 1,
+        col=1,
+    )
+
+    for p in p_peaks:
+        fig.add_vline(x=time_axis[p], line_color="green", line_dash="dash")
+
+    for s in s_peaks:
+        fig.add_vline(x=time_axis[s], line_color="red", line_dash="dash")
+
+fig.add_trace(go.Scatter(x=time_axis, y=det_win, name="Detection"), row=4, col=1)
+fig.add_trace(go.Scatter(x=time_axis, y=p_win, name="P prob"), row=4, col=1)
+fig.add_trace(go.Scatter(x=time_axis, y=s_win, name="S prob"), row=4, col=1)
+
+fig.update_yaxes(range=[0, 1], row=4, col=1)
+fig.update_layout(height=900, hovermode="x unified")
+
+st.plotly_chart(fig, use_container_width=True)
