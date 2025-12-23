@@ -109,7 +109,7 @@ def process_raw_trace(trace, sensor: IngestSensor):
         return
         
     if fs != sensor.fs:
-        logger.warning(f"{sensor_key} trace {t0} {tend} have unequal sample rate {fs} (it should be {s.fs}), skipping")
+        logger.warning(f"{sensor_key} trace {t0} {tend} have unequal sample rate {fs} (it should be {sensor.fs}), skipping")
         return
         
     for i, sample in enumerate(trace.data.tolist()):

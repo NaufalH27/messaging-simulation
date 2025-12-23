@@ -170,7 +170,7 @@ if tab == "Live Stream":
 
     FS = 100
     FREQ = "10ms"
-    WINDOW_SECONDS = 60
+    WINDOW_SECONDS = 120
     DECIMATE = 1
 
 
@@ -202,11 +202,11 @@ if tab == "Live Stream":
         FROM predicted_samples FINAL
         WHERE key = {key:String}
         AND model_name = {model:String}
-        AND ts >= latest_ts - INTERVAL 60 SECOND
+        AND ts >= latest_ts - INTERVAL 2 MINUTES
         ORDER BY ts
     """
 
-    @st.fragment(run_every="2s")
+    @st.fragment(run_every="5s")
     def live_refresh():
         df = get_ch().query_df(
             query,
@@ -215,6 +215,12 @@ if tab == "Live Stream":
                 "model": selected_model,
             },
         )
+        st.markdown(
+            f"<div style='text-align: right;'>fetch done</div>",
+            unsafe_allow_html=True
+        )
+        if df.empty:
+            st.warning("No Data")
 
         if not df.empty:
             df["ts"] = pd.to_datetime(df["ts"], utc=True)
@@ -261,7 +267,7 @@ if tab == "Live Stream":
 
             plot_live.plotly_chart(
                 fig,
-                use_container_width=True,
+                width="stretch",
                 key="live_plot"
             )
             lateness = datetime.now(timezone.utc) - end_ts
@@ -535,6 +541,6 @@ if tab == "Archive":
         )
         st.plotly_chart(
             fig,
-            use_container_width=True,
+            width="stretch",
             key="archive_plot"
         )
