@@ -1,4 +1,4 @@
-stramlit 
+streamlit 
 streamlit-autorefresh
 clickhouse-connect 
 plotly 

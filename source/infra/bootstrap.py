@@ -68,7 +68,7 @@ def bootstrap_infra(settings: AppSettings) -> InfraServices:
                 "FeedForward": FeedForward,
                 "f1": f1,
             },
-            gpu_memory_limit=2080,
+            gpu_memory_limit=3000,
         )
 
         logger.info("Infrastructure initialization completed successfully")

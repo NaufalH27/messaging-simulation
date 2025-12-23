@@ -23,11 +23,17 @@ class PredictionResults(BaseModel):
     ss: float
 
 
-def start_scylla_sink(consumerService: KafkaConsumerService, scyllaService: ScyllaService, batch_size: int = 500):
+from collections import defaultdict
+
+def start_scylla_sink(
+    consumerService: KafkaConsumerService,
+    scyllaService: ScyllaService,
+    batch_size: int = 5000
+):
     logger.info("scylla sink started")
     consumer = consumerService.get_consumer()
-    
-    batch = []
+
+    batches = defaultdict(list)
 
     while True:
         msg = consumer.poll(1.0)
@@ -36,17 +42,26 @@ def start_scylla_sink(consumerService: KafkaConsumerService, scyllaService: Scyl
             continue
 
         if msg.error():
-            logger.warning("Kafka error (skipping data):", msg.error())
+            logger.warning("Kafka error (skipping data): %s", msg.error())
             continue
 
         try:
             payload = json.loads(msg.value().decode("utf-8"))
-            results = PredictionResults(**payload)
-            batch.append(results)
+            result = PredictionResults(**payload)
         except Exception as e:
-            logger.warning("Invalid message (skipping data):", e)
+            logger.warning("Invalid message (skipping data): %s", e)
             continue
 
+        hour = (
+            result.ts
+            .astimezone(timezone.utc)
+            .replace(minute=0, second=0, microsecond=0)
+        )
+        batch_key = (result.key, result.model_name, hour)
+        batch = batches[batch_key]
+        batch.append(result)
+
         if len(batch) >= batch_size:
-            scyllaService.insert_predictions_batch(batch)
-            batch.clear()  # 
+            scyllaService.insert_predictions(batch)
+            batch.clear()
+
