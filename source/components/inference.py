@@ -278,5 +278,5 @@ def prediction_emitter(sensor: InferenceSensor, producerService: KafkaProducerSe
                     }
                     producer.produce(topic=topic_name, value=json.dumps(message).encode("utf-8"))
                     producer.poll(0)
-                logger.info(f"sending to predict consumer {sensor.key}: {window.starttime} - {window.endtime}")
+                logger.debug(f"sending to predict consumer {sensor.key}: {window.starttime} - {window.endtime}")
         time.sleep(2)
