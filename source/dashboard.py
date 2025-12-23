@@ -88,25 +88,27 @@ def plot_waveform_plotly(
 
         # P picks
         for idx in p_peaks:
-            fig.add_vline(
-                x=time_axis[idx],
-                line_color="red",
-                line_dash="dash",
-                line_width=1,
-                row=i + 1,
-                col=1,
-            )
+            if det_win[idx] >= DET_TRESHOLD:
+                fig.add_vline(
+                    x=time_axis[idx],
+                    line_color="red",
+                    line_dash="dash",
+                    line_width=1,
+                    row=i + 1,
+                    col=1,
+                )
 
         # S picks
         for idx in s_peaks:
-            fig.add_vline(
-                x=time_axis[idx],
-                line_color="purple",
-                line_dash="dash",
-                line_width=1,
-                row=i + 1,
-                col=1,
-            )
+            if det_win[idx] >= DET_TRESHOLD:
+                fig.add_vline(
+                    x=time_axis[idx],
+                    line_color="purple",
+                    line_dash="dash",
+                    line_width=1,
+                    row=i + 1,
+                    col=1,
+                )
 
     fig.add_trace(
         go.Scatter(x=time_axis, y=det_win, mode="lines", name="Detection"),
@@ -154,6 +156,11 @@ def get_ch():
 
 if tab == "Live Stream":
     st.header("Live Stream (ClickHouse)")
+    FS = 100
+    FREQ = "10ms"
+    WINDOW_SECONDS = 120
+    DECIMATE = 1
+
 
     LIVE_REFRESH_SEC = 1
     @st.cache_data(ttl=30)
@@ -161,18 +168,18 @@ if tab == "Live Stream":
         ch = get_ch()
         result = ch.query(f"""
             SELECT key, model_name
-            FROM {CH_TABLE}
-            GROUP BY key, model_name
-            ORDER BY key, model_name
+            FROM
+            (
+                SELECT
+                    key,
+                    model_name,
+                    max(ts) AS latest_ts
+                FROM predicted_samples
+                GROUP BY key, model_name
+            )
+            ORDER BY latest_ts DESC
         """)
         return result.result_rows
-
-
-    FS = 100
-    FREQ = "10ms"
-    WINDOW_SECONDS = 120
-    DECIMATE = 1
-
 
     rows = load_key_model_pairs()
     pair_labels = {
@@ -214,10 +221,6 @@ if tab == "Live Stream":
                 "key": selected_key,
                 "model": selected_model,
             },
-        )
-        st.markdown(
-            f"<div style='text-align: right;'>fetch done</div>",
-            unsafe_allow_html=True
         )
         if df.empty:
             st.warning("No Data")
