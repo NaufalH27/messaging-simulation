@@ -206,7 +206,7 @@ if tab == "Live Stream":
         ORDER BY ts
     """
 
-    @st.fragment(run_every="3s")
+    @st.fragment(run_every="2s")
     def live_refresh():
         df = get_ch().query_df(
             query,
@@ -263,6 +263,12 @@ if tab == "Live Stream":
                 fig,
                 use_container_width=True,
                 key="live_plot"
+            )
+            lateness = datetime.now(timezone.utc) - end_ts
+
+            st.markdown(
+                f"<div style='text-align: right;'>lateness: {lateness}</div>",
+                unsafe_allow_html=True
             )
     live_refresh()
 
