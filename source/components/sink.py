@@ -52,8 +52,10 @@ def start_scylla_sink(
             logger.warning("Invalid message (skipping data): %s", e)
             continue
 
+        u_ts = result.ts.replace(tzinfo=timezone.utc)
+
         hour = (
-            result.ts
+            u_ts
             .astimezone(timezone.utc)
             .replace(minute=0, second=0, microsecond=0)
         )

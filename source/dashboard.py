@@ -51,11 +51,13 @@ def plot_waveform_plotly(
     s_win,
     uirevision_key,
     time_axis,
+    utc=False,
     P_THRESHOLD=0.5,
     S_THRESHOLD=0.5,
 ):
     time_axis = pd.to_datetime(time_axis, utc=True)
-    time_axis = time_axis.tz_convert("Etc/GMT-7")  
+    if not utc:
+        time_axis = time_axis.tz_convert("Etc/GMT-7")  
     p_peaks, _ = find_peaks(np.nan_to_num(p_win), height=P_THRESHOLD)
     s_peaks, _ = find_peaks(np.nan_to_num(s_win), height=S_THRESHOLD)
 
@@ -540,7 +542,8 @@ if tab == "Archive":
             time_axis=df_win.index,
             P_THRESHOLD=P_THRESHOLD,
             S_THRESHOLD=S_THRESHOLD,
-            uirevision_key=f"archive-{selected_key}-{selected_model}-{selected_day}"
+            uirevision_key=f"archive-{selected_key}-{selected_model}-{selected_day}",
+            utc=True
         )
         st.plotly_chart(
             fig,

@@ -90,6 +90,7 @@ class ScyllaService:
         hours = set()
         for p in predictions:
             self.write_sem.acquire()
+            p.ts = p.ts.replace(tzinfo=timezone.utc)
             hour = (
                 p.ts
                 .astimezone(timezone.utc)

@@ -123,7 +123,7 @@ def window_emitter(sensor:IngestSensor, producerService :KafkaProducerService, t
     producer = producerService.get_producer()
 
     nan_threshold = 0.95
-    max_age = 60 
+    max_age = 45
     last_yyy = []
 
     while True:
@@ -141,7 +141,7 @@ def window_emitter(sensor:IngestSensor, producerService :KafkaProducerService, t
             if not sensor.windows:
                 time.sleep(0.1)
                 continue
-            keys = sorted(sensor.windows)[5:]
+            keys = sorted(sensor.windows)
             while keys:
                 w_key = keys[0]
                 w = sensor.windows[w_key]
